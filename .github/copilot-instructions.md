@@ -1,78 +1,87 @@
-## Purpose
+# File Cleaner AI Conventions
 
-This file tells AI coding agents how the file-cleaner project is organized and what conventions to follow when implementing features. Use these instructions to produce code that matches the existing project spec (found in `agents.md`).
+## Project Overview
 
-## Big picture (what to build)
+**File Cleaner** is a Python desktop application that organizes files by analyzing content with Google Gemini and grouping them into structured folders. The app provides a GUI for non-technical users to quickly classify documents without manual work.
 
-- Desktop Python app (GUI) to analyze and group files by semantic similarity and detect duplicates.
-- Major modules (one file each): `main.py`, `ai_engine.py`, `file_utils.py`, `gui.py`.
-- Config: `config.yaml` stores API keys and runtime settings. Default output folder: `organized_files`.
+### Architecture
 
-## Data flow / component responsibilities
+The codebase is split into **4 core modules**:
 
-1. GUI (`gui.py`) lets the user pick a folder and shows a file list + preview of grouping.
-2. `file_utils.py` reads files (txt, docx, pdf), extracts text, computes hashes for duplicate detection, and provides per-file summaries.
-3. `ai_engine.py` prepares prompts, calls the Gemini REST API, and returns a JSON grouping description like [{"group_name":..., "files":[...]}].
-4. `main.py` orchestrates flow: request analysis, get grouping, show preview, then move files and write `metadata.txt` per group.
+- **`gui.py`**: `tk.Tk` app with folder selection, file listing, grouping preview, and undo stack
+- **`ai_engine.py`**: Gemini API integration, prompt building, response parsing with graceful fallback
+- **`file_utils.py`**: Recursive file scanning, text extraction (TXT/DOCX/PDF), SHA-256 deduplication, batch file operations
+- **`config.yaml`**: API key + model configuration (read by both `ai_engine` and `gui` for thresholds/output paths)
 
-## Project-specific conventions and examples
+**Key Data Flow**: User selects folder → `scan_directory()` extracts file metadata (including 400-char summaries) → `group_files_with_ai()` sends to Gemini with prompt → results parsed into JSON groups → `apply_grouping()` moves files and creates `metadata.txt` per folder + CSV export.
 
-- Config (`config.yaml`) example (must be supported exactly):
+## Critical Patterns
 
-```yaml
-gemini_api_key: "YOUR_API_KEY_HERE"
-model: "gemini-2.5-flash"
-similarity_threshold: 0.85
-output_folder: "organized_files"
+### Threading & UI Safety
+- GUI runs on main thread; long operations (`scan_directory`, Gemini calls) run in daemon threads via `threading.Thread`
+- Use `self.after(0, callback)` to marshal UI updates back to main thread (see `_finalize_analysis`)
+- All logging via `self.log()` which detects thread context automatically
+
+### Error Handling & Fallback
+- **API Failure**: `group_files_with_ai()` catches Gemini errors and falls back to file-extension-based grouping (`_fallback_grouping()`)
+- **Missing Dependencies**: Text extractors wrap imports in try-except; `Document = None` and `PdfReader = None` indicate optional deps
+- **Partial Read Failures**: `extract_text()` catches per-file exceptions; bad PDFs/DOCXs log but don't crash the full scan
+
+### Configuration Pattern
+- `config.yaml` is read fresh each call: `load_config(config_path="config.yaml")` in both `ai_engine.py` and `gui.py`
+- Required keys: `gemini_api_key`, `model`, `similarity_threshold`, `output_folder`
+- **Note**: API key validation happens at Gemini call time, not startup
+
+### File Deduplication
+- Uses SHA-256 hashing (`compute_hash()`) over file content, **not** filename matching
+- `detect_duplicates()` groups files by hash; `threshold` param unused (kept for API parity)
+- Duplicates moved to `Duplikat/` folder with metadata referencing original
+
+### Metadata Generation
+- Each group gets `metadata.txt` (human-readable) and centralized `metadata_summary.csv` + optional `.xlsx`
+- CSV includes: `group_name`, `file_name`, `original_path`, `new_path`, `description`, `timestamp`
+- Metadata written *after* all file moves to ensure atomic operation
+
+### File Paths & Locale
+- Use `Path` from `pathlib` exclusively (all existing code does); avoid `os.path` strings
+- Text is **all Indonesian** (UI labels, log messages, error text, metadata) — maintain this for user consistency
+- Relative paths stored in `extra_metadata['relative_path']` for grouping prompts
+
+## Development Workflows
+
+### Running Locally
+```bash
+python main.py
 ```
+Starts the GUI. Application auto-falls back from `customtkinter` to `tkinter` if not installed.
 
-- Default similarity threshold: 0.85 — use this value unless the user explicitly changes it via config.
-- Output folder name: `organized_files`.
-- Metadata file: write a human-readable `metadata.txt` in each group folder containing group summary, file list, and timestamp.
+### Testing Configuration
+- Place test files in a folder and update `config.yaml` with a valid Gemini API key
+- Set `similarity_threshold: 0.85` and `output_folder: organized_files` for standard behavior
 
-## Integration details (exact patterns to follow)
+### Debugging Gemini Responses
+- `_parse_groups_from_text()` extracts JSON from markdown code blocks (triple backticks) or raw JSON
+- Falls back to line-by-line parser if JSON fails: expects `Group_Name:` lines followed by comma-separated filenames
+- Examine raw response in returned `GroupingResult.raw_response` if parsing fails
 
-- Gemini REST call pattern (refer to `agents.md` example):
+### Undo Stack Design
+- `gui.py` maintains `self.undo_stack: List[List[dict]]` of move operations (source/target paths)
+- Each `apply_grouping()` call pushes one list of ops; `undo_last_move()` pops and reverses
+- Undo attempts to remove empty folders but ignores errors (folder may have new files)
 
-  POST to
-  `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`
+## Code Conventions
 
-  Headers: `Authorization: Bearer {gemini_api_key}` and JSON payload containing `model` and `input` text.
+- **Type Hints**: Use `from __future__ import annotations` + full type hints (e.g., `List[Dict[str, object]]`)
+- **Dataclasses**: `FileInfo` uses `@dataclass` with `field(default_factory=...)` for mutable defaults
+- **Imports**: Relative imports in module (`from .gui import FileOrganizerApp`), fallback to absolute when run as script
+- **Logging**: Use `logging.getLogger(__name__)` per module; configured in `main.py` via `configure_logging()`
+- **Path Operations**: `Path.rglob("*")` for recursion, `Path.suffix.lower()` for extension matching
+- **String Formatting**: Use f-strings; concatenate multi-line prompts with explicit `\n`
 
-- Prompt/response contract: `ai_engine.analyze_files_with_gemini(file_summaries)` should return a parsed Python list of dicts with keys `group_name` and `files`.
+## Extension Points
 
-## UI / UX expectations
+**Adding a new file type**: Update `SUPPORTED_EXTENSIONS` in `file_utils.py`, then add extraction function (e.g., `_read_xlsx_file()`) and register in `extract_text()`.
 
-- GUI should offer: "Choose Folder", "Analyze & Group", progress indicator, preview of grouping, "Apply" to move files, and an "Undo" for the last move.
-- Always show preview (do not move files automatically). Implement a simple undo log for the last operation.
+**Customizing Grouping Logic**: Modify `_build_prompt()` in `ai_engine.py` to change the instruction sent to Gemini (currently Indonesian). Parser in `_parse_groups_from_text()` must handle the response format.
 
-## Running & developer workflow
-
-- Intended run command: `python main.py` (project is single-process desktop app).
-- Use a virtualenv and `pip install -r requirements.txt`. If `requirements.txt` is missing, include common libs: `requests`, `PyYAML`, `python-docx`, `PyPDF2`, `tqdm`, and either `customtkinter` or rely on `tkinter`.
-
-## Tests & quality gates
-
-- There are no tests in the repo yet. When adding tests, place them under `tests/` and add a minimal test for `file_utils.read_text()` and `ai_engine.analyze_files_with_gemini()` (mock the network call).
-
-## Code style & small patterns
-
-- Keep modules small and single-responsibility. Functions should return plain Python types (dict/list/str) not custom objects unless clearly needed.
-- For file moves, use `shutil.move` and preserve original timestamps when possible.
-- Use `hashlib` (e.g., SHA256) for duplicate detection and include the hash in `metadata.txt` when a duplicate is placed in the `Duplikat/` folder.
-
-## What to avoid
-
-- Don't hardcode API keys in source. Read them from `config.yaml`.
-- Don't move files before user confirms the preview.
-
-## Where to look in this repo
-
-- `agents.md` (project spec + example prompt and example `ai_engine` function) — the authoritative source for behavior and prompt examples.
-
-## If files are missing (practical guidance for agents)
-
-- This repository currently contains only docs (no implementation). If asked to implement features, bootstrap the four modules above plus `requirements.txt` and `config.yaml` (with the example values). Provide a minimal `README.md` with run steps and a tiny demo dataset under `example_data/` when appropriate.
-
----
-If anything in this file looks wrong or incomplete, tell me which area to expand (prompts, GUI details, test harness, or Gemini integration examples).
+**UI Customization**: All widgets in `gui.py:_build_widgets()`. The app respects `customtkinter` theme if available; stick to `ttk` widgets for fallback compatibility.
